@@ -52,7 +52,7 @@ def get_active_domains():
         logger.info(f"Active domains: {domains}")
         return domains
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error getting active domains: {e}")
+        logger.error(f"Error getting active domains: {e.stderr}")
         return []
 
 # Function to check if LiteSpeed is the primary server
@@ -63,7 +63,7 @@ def is_litespeed_primary():
         logger.info(f"LiteSpeed primary: {is_active}")
         return is_active
     except Exception as e:
-        logger.error(f"Error checking LiteSpeed status: {e}")
+        logger.error(f"Error checking LiteSpeed status: {str(e)}")
         return False
 
 # Function to read and validate IP addresses from the Apache configuration file
@@ -79,6 +79,7 @@ def read_ip_addresses(content):
 def validate_ip_address(ip):
     try:
         ipaddress.ip_network(ip, strict=False)
+        logger.debug(f"Validated IP address: {ip}")
         return True
     except ValueError:
         logger.warning(f"Invalid IP address: {ip}")
@@ -98,13 +99,14 @@ def generate_config(ip_addresses, litespeed, location_path):
 def validate_config(config_path):
     try:
         result = subprocess.run(['apachectl', 'configtest'], capture_output=True, text=True)
-        if "Syntax OK" in result.stdout:
+        if result.returncode == 0 and "Syntax OK" in result.stdout:
+            logger.info(f"Config validation succeeded: {config_path}")
             return True
         else:
-            logger.error(f"Config validation failed: {result.stdout}")
+            logger.error(f"Config validation failed: {result.stdout.strip()} {result.stderr.strip()}")
             return False
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error validating config: {e}")
+        logger.error(f"Error validating config: {e.stderr}")
         return False
 
 # Function to update configuration files for each domain
@@ -120,6 +122,7 @@ def update_domain_config(domain):
         
         ip_addresses = read_ip_addresses(content)
         if not ip_addresses:
+            logger.info(f"No valid IP addresses found for {domain}")
             return
         
         litespeed = is_litespeed_primary()
@@ -139,12 +142,14 @@ def update_domain_config(domain):
         # Create a backup of the existing configuration file
         if os.path.exists(config_path):
             os.rename(config_path, backup_path)
+            logger.info(f"Backup created for {domain}: {backup_path}")
 
         if args.dry_run:
             logger.info(f"Dry run: {config_path} would be updated with new IP configuration.")
         else:
             with open(config_path, 'w') as f:
                 f.write(content)
+            logger.info(f"Config file written for {domain}: {config_path}")
 
             if validate_config(config_path):
                 if litespeed:
@@ -161,11 +166,12 @@ def update_domain_config(domain):
         # Restore the backup if an error occurs
         if os.path.exists(backup_path):
             os.rename(backup_path, config_path)
-        logger.error(f"Error updating config for {domain}: {e}")
+        logger.error(f"Error updating config for {domain}: {str(e)}")
     finally:
         # Clean up the backup file if everything was successful
         if not args.dry_run and os.path.exists(backup_path):
             os.remove(backup_path)
+            logger.info(f"Backup cleaned up for {domain}: {backup_path}")
 
 # Function to monitor changes in domain configuration files
 class ConfigChangeHandler(FileSystemEventHandler):
@@ -189,7 +195,7 @@ def update_configs(domains):
                 future.result()
                 logger.info(f"Config updated for {domain}")
             except Exception as e:
-                logger.error(f"Error updating config for {domain}: {e}")
+                logger.error(f"Error updating config for {domain}: {str(e)}")
 
 # Main function
 def main():
@@ -198,6 +204,8 @@ def main():
         logger.error("No active domains found. Exiting.")
         return
     
+    update_configs(domains)
+
     event_handler = ConfigChangeHandler(domains)
     observer = Observer()
     for domain in domains:
