@@ -85,14 +85,35 @@ def update_litespeed_conf(content):
 
 def convert_to_apache2(match):
     location_block = match.group(0)
+    logger.debug(f"Original LiteSpeed <Location> block: {location_block}")
+
+    # Convert LiteSpeed directives to Apache2 format
     location_block = location_block.replace('order allow,deny', 'Require all granted')
+    location_block = location_block.replace('Order allow,deny', 'Require all granted')
     location_block = location_block.replace('deny from all', 'Require all denied')
+    location_block = location_block.replace('Deny from all', 'Require all denied')
+
+    # Convert IP Allow and Deny to Apache2 format
+    location_block = re.sub(r'Allow from all', 'Require all granted', location_block)
+    location_block = re.sub(r'Allow from\s+([^\s"]+)', r'Require ip \1', location_block)
+    location_block = re.sub(r'Deny from\s+([^\s"]+)', r'Require not ip \1', location_block)
+
+    logger.debug(f"Converted Apache2 <Location> block: {location_block}")
     return location_block
 
 def convert_to_litespeed(match):
     location_block = match.group(0)
-    location_block = location_block.replace('Require all granted', 'order allow,deny')
-    location_block = location_block.replace('Require all denied', 'deny from all')
+    logger.debug(f"Original Apache2 <Location> block: {location_block}")
+
+    # Convert Apache2 directives to LiteSpeed format
+    location_block = location_block.replace('Require all granted', 'Order allow,deny\nAllow from all')
+    location_block = location_block.replace('Require all denied', 'Order allow,deny\nDeny from all')
+
+    # Convert IP Require to LiteSpeed format
+    location_block = re.sub(r'Require ip\s+([^\s"]+)', r'Allow from \1', location_block)
+    location_block = re.sub(r'Require not ip\s+([^\s"]+)', r'Deny from \1', location_block)
+
+    logger.debug(f"Converted LiteSpeed <Location> block: {location_block}")
     return location_block
 
 def update_conf_file(file_path, content, mode, dry_run):
