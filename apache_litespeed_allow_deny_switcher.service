@@ -1,0 +1,12 @@
+[Unit]
+Description=Apache2 Litespeed Location Allow Deny Configuration Syntax Switch Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/apache_litespeed_allow_deny_switcher.py
+Restart=always
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target

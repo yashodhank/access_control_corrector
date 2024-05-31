@@ -1,0 +1,14 @@
+log_file: /var/log/webserver_switch.log
+log_max_size: 10485760  # 10 MB in bytes
+backup_ext: .bak
+max_workers: 8  # Increased to handle more concurrency
+check_interval: 5  # Reduced interval for quicker reaction to changes
+paths:
+  apache2:
+    - /etc/apache2/sites-available/
+    - /etc/httpd/conf.d/
+  litespeed:
+    - /usr/local/lsws/conf/vhosts/
+  windows:
+    apache2: C:\\Apache24\\conf\\vhosts\\
+    litespeed: C:\\litespeed\\conf\\vhosts
