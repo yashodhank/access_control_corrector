@@ -103,10 +103,10 @@ def validate_config(config_path):
             logger.info(f"Config validation succeeded: {config_path}")
             return True
         else:
-            logger.error(f"Config validation failed: {result.stdout.strip()} {result.stderr.strip()}")
+            logger.error(f"Config validation failed for {config_path}: stdout: {result.stdout.strip()} stderr: {result.stderr.strip()}")
             return False
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error validating config: {e.stderr}")
+        logger.error(f"Error validating config for {config_path}: {e.stderr}")
         return False
 
 # Function to update configuration files for each domain
@@ -128,89 +128,55 @@ def update_domain_config(domain):
         litespeed = is_litespeed_primary()
         
         # Extract and update <Location> blocks
-        location_blocks = re.findall(r'(<Location [^>]+>.*?</Location>)', content, re.DOTALL)
-        for location_block in location_blocks:
-            location_path_match = re.search(r'<Location ([^>]+)>', location_block)
-            if location_path_match:
-                location_path = location_path_match.group(1)
-                updated_config = generate_config(ip_addresses, litespeed, location_path)
-                content = content.replace(location_block, updated_config)
-
-        config_path = os.path.join(APACHE_CONF_DIR, f"{domain}.conf")
-        backup_path = f"{config_path}.bak"
-
-        # Create a backup of the existing configuration file
-        if os.path.exists(config_path):
-            os.rename(config_path, backup_path)
-            logger.info(f"Backup created for {domain}: {backup_path}")
-
+        location_blocks = re.findall(r'<Location\s+[^>]+>.*?</Location>', content, re.DOTALL)
+        updated_blocks = []
+        
+        for block in location_blocks:
+            location_path = re.search(r'<Location\s+([^>]+)>', block).group(1)
+            new_block = generate_config(ip_addresses, litespeed, location_path)
+            updated_blocks.append(new_block)
+        
+        new_content = content
+        for old_block, new_block in zip(location_blocks, updated_blocks):
+            new_content = new_content.replace(old_block, new_block)
+        
+        # Write new configuration to a temporary file for validation
+        temp_conf_file = f"{conf_file}.tmp"
+        with open(temp_conf_file, 'w') as file:
+            file.write(new_content)
+        
         if args.dry_run:
-            logger.info(f"Dry run: {config_path} would be updated with new IP configuration.")
+            logger.info(f"Dry run: {conf_file} would be updated with new IP configuration.")
+            os.remove(temp_conf_file)
         else:
-            with open(config_path, 'w') as f:
-                f.write(content)
-            logger.info(f"Config file written for {domain}: {config_path}")
-
-            if validate_config(config_path):
-                if litespeed:
-                    subprocess.run(['systemctl', 'reload', 'lsws'])
-                else:
-                    subprocess.run(['systemctl', 'reload', 'apache2'])
-                logger.info(f"Config updated and validated for {domain}")
-            else:
-                # Restore the backup if validation fails
-                if os.path.exists(backup_path):
-                    os.rename(backup_path, config_path)
-                logger.error(f"Config validation failed for {domain}, restored backup")
-    except Exception as e:
-        # Restore the backup if an error occurs
-        if os.path.exists(backup_path):
-            os.rename(backup_path, config_path)
-        logger.error(f"Error updating config for {domain}: {str(e)}")
-    finally:
-        # Clean up the backup file if everything was successful
-        if not args.dry_run and os.path.exists(backup_path):
-            os.remove(backup_path)
-            logger.info(f"Backup cleaned up for {domain}: {backup_path}")
-
-# Function to monitor changes in domain configuration files
-class ConfigChangeHandler(FileSystemEventHandler):
-    def __init__(self, domains):
-        self.domains = domains
-
-    def on_modified(self, event):
-        for domain in self.domains:
-            if domain in event.src_path:
-                logger.info(f"Detected change in {event.src_path}")
-                update_domain_config(domain)
-                break
-
-# Function to update configurations for all domains
-def update_configs(domains):
-    with ThreadPoolExecutor(max_workers=min(os.cpu_count(), len(domains))) as executor:
-        futures = {executor.submit(update_domain_config, domain): domain for domain in domains}
-        for future in as_completed(futures):
-            domain = futures[future]
-            try:
-                future.result()
+            if validate_config(temp_conf_file):
+                os.rename(temp_conf_file, conf_file)
                 logger.info(f"Config updated for {domain}")
-            except Exception as e:
-                logger.error(f"Error updating config for {domain}: {str(e)}")
+            else:
+                logger.error(f"Config validation failed for {domain}, restored backup")
+                os.remove(temp_conf_file)
+    except Exception as e:
+        logger.error(f"Error processing domain {domain}: {str(e)}")
+
+# Event handler for file changes
+class ConfigChangeHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.endswith('.conf'):
+            domain = event.src_path.split('/')[5]
+            logger.info(f"Detected change in {event.src_path}")
+            update_domain_config(domain)
 
 # Main function
 def main():
-    domains = get_active_domains()
-    if not domains:
-        logger.error("No active domains found. Exiting.")
-        return
-    
-    update_configs(domains)
-
-    event_handler = ConfigChangeHandler(domains)
+    active_domains = get_active_domains()
     observer = Observer()
-    for domain in domains:
-        domain_conf_dir = os.path.join(DOMAIN_CONF_DIR, domain, 'conf')
-        observer.schedule(event_handler, path=domain_conf_dir, recursive=True)
+    event_handler = ConfigChangeHandler()
+    
+    for domain in active_domains:
+        domain_conf_path = os.path.join(DOMAIN_CONF_DIR, domain, 'conf')
+        observer.schedule(event_handler, path=domain_conf_path, recursive=False)
     
     observer.start()
     try:
@@ -220,5 +186,5 @@ def main():
         observer.stop()
     observer.join()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
