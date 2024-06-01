@@ -12,10 +12,24 @@ from logging.handlers import RotatingFileHandler
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+# Setup logging
+logger = logging.getLogger('WebServerSwitch')
+logger.setLevel(logging.DEBUG)
+handler = RotatingFileHandler('/var/log/webserver_switch.log', maxBytes=10 * 1024 * 1024, backupCount=5)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 # Load configuration
 def load_config(config_file='config.yaml'):
-    with open(config_file, 'r') as f:
-        return yaml.safe_load(f)
+    logger.info(f"Loading configuration from {config_file}")
+    try:
+        with open(config_file, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"Failed to load configuration: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 config = load_config()
 
@@ -27,13 +41,9 @@ MAX_WORKERS = config['max_workers']
 CHECK_INTERVAL = config['check_interval']
 PATHS = config['paths']
 
-# Setup logging
-logger = logging.getLogger('WebServerSwitch')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=5)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+# Update logging to use config values
+handler.maxBytes = LOG_MAX_SIZE
+logger.handlers[0].baseFilename = LOG_FILE
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Daemon for switching between Apache2 and LiteSpeed configuration syntax.')
@@ -44,10 +54,13 @@ def parse_args():
     return parser.parse_args()
 
 def validate_config(config):
+    logger.debug("Validating configuration")
     required_keys = ['log_file', 'log_max_size', 'backup_ext', 'max_workers', 'check_interval', 'paths']
     for key in required_keys:
         if key not in config:
+            logger.error(f"Missing required configuration key: {key}")
             raise ValueError(f"Missing required configuration key: {key}")
+    logger.debug("Configuration validation completed successfully")
 
 def determine_active_mode():
     logger.info("Determining active web server mode...")
@@ -69,24 +82,33 @@ def determine_active_mode():
         elif os.path.exists(litespeed_path):
             logger.info(f"Active mode detected: LiteSpeed (path: {litespeed_path})")
             return 'litespeed', litespeed_path
+    logger.error("Unsupported OS or web server not installed.")
     raise RuntimeError('Unsupported OS or web server not installed.')
 
 def load_conf_files(conf_dir):
     logger.info(f"Loading configuration files from directory: {conf_dir}")
     conf_files = {}
-    for root, _, files in os.walk(conf_dir):
-        for file in files:
-            if file.endswith('.conf'):
-                conf_path = os.path.join(root, file)
-                with open(conf_path, 'r') as f:
-                    conf_files[conf_path] = f.read()
-                logger.debug(f"Loaded configuration file: {conf_path}")
+    try:
+        for root, _, files in os.walk(conf_dir):
+            for file in files:
+                if file.endswith('.conf'):
+                    conf_path = os.path.join(root, file)
+                    with open(conf_path, 'r') as f:
+                        conf_files[conf_path] = f.read()
+                    logger.debug(f"Loaded configuration file: {conf_path}")
+    except Exception as e:
+        logger.error(f"Failed to load configuration files: {e}")
+        logger.error(traceback.format_exc())
     return conf_files
 
 def backup_file(file_path):
     backup_path = file_path + BACKUP_EXT
-    shutil.copyfile(file_path, backup_path)
-    logger.info(f"Backup created: {backup_path}")
+    try:
+        shutil.copyfile(file_path, backup_path)
+        logger.info(f"Backup created: {backup_path}")
+    except Exception as e:
+        logger.error(f"Failed to create backup for {file_path}: {e}")
+        logger.error(traceback.format_exc())
 
 def update_apache2_conf(content):
     pattern = re.compile(r'<Location .*?>.*?</Location>', re.DOTALL)
@@ -135,9 +157,17 @@ def update_conf_file(file_path, content, mode, dry_run):
     if content != updated_content:
         if not dry_run:
             backup_file(file_path)
-            with open(file_path, 'w') as f:
-                f.write(updated_content)
-        logger.info(f"Configuration updated for: {file_path}")
+            try:
+                with open(file_path, 'w') as f:
+                    f.write(updated_content)
+                logger.info(f"Configuration updated for: {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to write updated configuration for {file_path}: {e}")
+                logger.error(traceback.format_exc())
+        else:
+            logger.info(f"Dry run mode enabled. Configuration not written for: {file_path}")
+    else:
+        logger.info(f"No changes detected for: {file_path}")
 
 def process_conf_files(conf_files, mode, dry_run):
     logger.info(f"Processing configuration files with mode: {mode}")
@@ -181,6 +211,7 @@ def monitor_and_update(dry_run):
 
     try:
         while True:
+            logger.debug("Monitoring...")
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         observer.stop()
@@ -210,5 +241,5 @@ def main():
     logger.info("Web server configuration switch daemon started.")
     monitor_and_update(args.dry_run)
 
-if __name__ == "__main__":
+if __name__ == "___MAIN__":
     main()
