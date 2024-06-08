@@ -43,6 +43,7 @@ logger.addHandler(console_handler)
 
 domain_cache = {}
 file_hashes = {}
+last_web_server = None
 
 def cleanup_old_logs():
     current_time = time.time()
@@ -142,6 +143,21 @@ def test_config(web_server):
         logger.error(f'Configuration test failed: {e.stderr.decode()}')
         return False
 
+def config_needs_update(domain, config_path, web_server):
+    async with aiofiles.open(config_path, 'r') as file:
+        lines = await file.readlines()
+    
+    for line in lines:
+        if web_server == 'LiteSpeed':
+            if 'Allow from' in line or 'Deny from' in line:
+                return True
+        elif web_server == 'Apache2':
+            if 'Allow' in line and 'Allow from' not in line:
+                return True
+            if 'Deny' in line and 'Deny from' not in line:
+                return True
+    return False
+
 class DomainConfigHandler(FileSystemEventHandler):
     def __init__(self, web_server):
         self.web_server = web_server
@@ -156,7 +172,8 @@ class DomainConfigHandler(FileSystemEventHandler):
             async with aiomultiprocess.Pool() as pool:
                 for domain, config_paths in self.batch.items():
                     for config_path in config_paths:
-                        tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
+                        if await config_needs_update(domain, config_path, self.web_server):
+                            tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
             await asyncio.gather(*tasks)
             self.batch.clear()
 
@@ -183,7 +200,14 @@ class DomainConfigHandler(FileSystemEventHandler):
         self.process(event)
 
 def main():
+    global last_web_server
     web_server, _ = detect_web_server()
+
+    if web_server != last_web_server:
+        logger.info(f'Web server change detected: {last_web_server} -> {web_server}')
+        last_web_server = web_server
+        file_hashes.clear()  # Clear file hashes to force re-validation of all configs
+
     if web_server:
         logger.info(f'{web_server} detected as active web server.')
 
