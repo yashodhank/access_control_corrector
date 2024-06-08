@@ -49,9 +49,13 @@ def cleanup_old_logs():
 
 def is_web_server_running(command):
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return True
-    except subprocess.CalledProcessError:
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode == 0:
+            return True
+        else:
+            return False
+    except Exception as e:
+        logger.error(f'Error checking web server status: {e}')
         return False
 
 def detect_web_server():

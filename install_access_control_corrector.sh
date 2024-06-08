@@ -14,9 +14,28 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# Detect OS and install dependencies
+install_dependencies() {
+    if [ -f /etc/debian_version ]; then
+        apt-get update
+        apt-get install -y python3 python3-venv git
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y epel-release
+        yum install -y python3 python3-venv git
+    elif [ -f /etc/almalinux-release ] || [ -f /etc/rocky-release ] || [ -f /etc/centos-release ]; then
+        dnf install -y epel-release
+        dnf install -y python3 python3-venv git
+    elif [ -f /etc/os-release ] && grep -q "Virtuozzo" /etc/os-release; then
+        yum install -y epel-release
+        yum install -y python3 python3-venv git
+    else
+        echo "Unsupported OS. Exiting."
+        exit 1
+    fi
+}
+
 # Install dependencies
-apt-get update
-apt-get install -y python3 python3-venv git
+install_dependencies
 
 # Clone the repository
 if [ -d "$INSTALL_DIR" ]; then
