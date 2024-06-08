@@ -13,6 +13,7 @@ from collections import defaultdict
 import asyncio
 import aiofiles
 import aiomultiprocess
+import hashlib
 
 # Configurations
 LOG_FILE = '/var/log/access_control_corrector.log'
@@ -41,6 +42,7 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 domain_cache = {}
+file_hashes = {}
 
 def cleanup_old_logs():
     current_time = time.time()
@@ -87,8 +89,21 @@ def domain_exists(domain):
         logger.debug(f'Domain does not exist: {domain}')
     return exists
 
+def compute_file_hash(filepath):
+    hash_md5 = hashlib.md5()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
 async def correct_syntax(domain, config_path, web_server):
     logger.debug(f'Correcting syntax for domain: {domain}, config_path: {config_path}, web_server: {web_server}')
+    
+    current_hash = compute_file_hash(config_path)
+    if file_hashes.get(config_path) == current_hash:
+        logger.debug(f'No changes detected in {config_path}. Skipping.')
+        return
+    
     async with aiofiles.open(config_path, 'r') as file:
         lines = await file.readlines()
 
@@ -109,6 +124,7 @@ async def correct_syntax(domain, config_path, web_server):
             async with aiofiles.open(config_path, 'w') as file:
                 await file.writelines(lines)
             logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
+            file_hashes[config_path] = compute_file_hash(config_path)
         else:
             logger.info(f'[Dry-Run] Backup and syntax correction would be done for {config_path} (domain: {domain})')
 
@@ -154,7 +170,7 @@ class DomainConfigHandler(FileSystemEventHandler):
 
         config_path = event.src_path
         domain = os.path.basename(os.path.dirname(os.path.dirname(config_path)))
-        if domain_exists(domain):
+        if domain_exists(domain) and config_path.endswith('httpd.conf'):
             logger.info(f'Scheduling change in config for domain: {domain}')
             self.schedule_processing(domain, config_path)
 
