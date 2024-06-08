@@ -1,0 +1,12 @@
+[Unit]
+Description=Access Control Corrector Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/access_control_corrector.py --verbose
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
