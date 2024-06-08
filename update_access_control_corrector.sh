@@ -17,7 +17,8 @@ systemctl stop $SERVICE_NAME
 
 # Update the repository
 cd "$INSTALL_DIR"
-git pull origin main
+git reset --hard
+git pull --depth=1 origin main
 
 # Activate virtual environment and install dependencies
 source "$INSTALL_DIR/venv/bin/activate"
