@@ -143,7 +143,7 @@ def test_config(web_server):
         logger.error(f'Configuration test failed: {e.stderr.decode()}')
         return False
 
-def config_needs_update(domain, config_path, web_server):
+async def config_needs_update(config_path, web_server):
     async with aiofiles.open(config_path, 'r') as file:
         lines = await file.readlines()
     
@@ -172,7 +172,7 @@ class DomainConfigHandler(FileSystemEventHandler):
             async with aiomultiprocess.Pool() as pool:
                 for domain, config_paths in self.batch.items():
                     for config_path in config_paths:
-                        if await config_needs_update(domain, config_path, self.web_server):
+                        if await config_needs_update(config_path, self.web_server):
                             tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
             await asyncio.gather(*tasks)
             self.batch.clear()
@@ -204,9 +204,9 @@ def main():
     web_server, _ = detect_web_server()
 
     if web_server != last_web_server:
-        logger.info(f'Web server change detected: {last_web_server} -> {web_server}')
+        logger.info(f'Web server switch detected: {last_web_server} -> {web_server}')
+        file_hashes.clear()
         last_web_server = web_server
-        file_hashes.clear()  # Clear file hashes to force re-validation of all configs
 
     if web_server:
         logger.info(f'{web_server} detected as active web server.')
