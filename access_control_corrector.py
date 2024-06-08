@@ -14,6 +14,7 @@ import asyncio
 import aiofiles
 import aiomultiprocess
 import re
+import shutil
 
 # Configurations
 LOG_FILE = '/var/log/access_control_corrector.log'
@@ -56,11 +57,14 @@ def cleanup_old_logs():
 def is_web_server_running():
     try:
         netstat_output = subprocess.check_output(['netstat', '-ntlp'], text=True)
-        ps_output = subprocess.check_output(['ps', '-aux'], text=True)
+        ps_output = subprocess.check_output(['ps', 'aux'], text=True)
         
-        if re.search(r'\bapache2\b', netstat_output) and re.search(r'\bapache2\b', ps_output):
+        apache_listening = re.search(r':80.*apache2|:443.*apache2', netstat_output)
+        litespeed_listening = re.search(r':80.*litespeed|:443.*litespeed', netstat_output)
+
+        if apache_listening and re.search(r'\bapache2\b', ps_output):
             return 'Apache2'
-        elif re.search(r'\blitespeed\b', netstat_output) and re.search(r'\blitespeed\b', ps_output):
+        elif litespeed_listening and re.search(r'\blitespeed\b', ps_output):
             return 'LiteSpeed'
     except subprocess.CalledProcessError as e:
         logger.error(f'Error checking web server status: {e}')
