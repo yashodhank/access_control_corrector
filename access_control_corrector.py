@@ -5,7 +5,7 @@ import subprocess
 import logging
 from logging.handlers import RotatingFileHandler
 import time
-import shutil
+import hashlib
 import argparse
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -13,14 +13,13 @@ from collections import defaultdict
 import asyncio
 import aiofiles
 import aiomultiprocess
-import hashlib
+import re
 
 # Configurations
 LOG_FILE = '/var/log/access_control_corrector.log'
 MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
 LOG_RETENTION = 3 * 30 * 24 * 60 * 60  # 3 months in seconds
 CHECK_INTERVAL = 3600  # Check every hour
-VHOSTS_PATH = '/var/www/vhosts/system'  # Path for vhost configurations
 BATCH_INTERVAL = 10  # Batch interval for processing changes
 
 # Set up argument parser
@@ -54,58 +53,30 @@ def cleanup_old_logs():
                 os.remove(file_path)
                 logger.info(f'Removed old log file: {file_path}')
 
-def get_listening_ports():
-    """Get a list of listening ports with their associated process names."""
+def is_web_server_running():
     try:
-        result = subprocess.run(['netstat', '-ntlp'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            return result.stdout
-    except Exception as e:
-        logger.error(f'Error executing netstat: {e}')
-    return ''
-
-def get_process_info():
-    """Get a list of running processes."""
-    try:
-        result = subprocess.run(['ps', 'aux'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            return result.stdout
-    except Exception as e:
-        logger.error(f'Error executing ps: {e}')
-    return ''
+        netstat_output = subprocess.check_output(['netstat', '-ntlp'], text=True)
+        ps_output = subprocess.check_output(['ps', '-aux'], text=True)
+        
+        if re.search(r'\bapache2\b', netstat_output) and re.search(r'\bapache2\b', ps_output):
+            return 'Apache2'
+        elif re.search(r'\blitespeed\b', netstat_output) and re.search(r'\blitespeed\b', ps_output):
+            return 'LiteSpeed'
+    except subprocess.CalledProcessError as e:
+        logger.error(f'Error checking web server status: {e}')
+        return None
 
 def detect_web_server():
-    netstat_output = get_listening_ports()
-    ps_output = get_process_info()
-
-    apache_ports = ['80', '443']
-    litespeed_ports = ['80', '443']
-    apache_processes = ['apache2', 'httpd']
-    litespeed_processes = ['litespeed', 'lshttpd']
-
-    # Check netstat output for ports
-    for line in netstat_output.split('\n'):
-        if any(f':{port} ' in line for port in apache_ports):
-            if any(proc in line for proc in apache_processes):
-                return 'Apache2', None
-        if any(f':{port} ' in line for port in litespeed_ports):
-            if any(proc in line for proc in litespeed_processes):
-                return 'LiteSpeed', None
-
-    # Check ps output for processes
-    for line in ps_output.split('\n'):
-        if any(proc in line for proc in apache_processes):
-            return 'Apache2', None
-        if any(proc in line for proc in litespeed_processes):
-            return 'LiteSpeed', None
-
-    return None, None
+    web_server = is_web_server_running()
+    if web_server:
+        return web_server
+    return None
 
 def domain_exists(domain):
     if domain in domain_cache:
         return domain_cache[domain]
     logger.debug(f'Checking if domain exists: {domain}')
-    result = subprocess.run(['/usr/local/psa/bin/domain', '-i', domain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(['plesk', 'bin', 'domain', '-i', domain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     exists = result.returncode == 0
     domain_cache[domain] = exists
     if exists:
@@ -133,14 +104,12 @@ async def correct_syntax(domain, config_path, web_server):
         lines = await file.readlines()
 
     modified_lines = []
-    new_lines = []
     for i, line in enumerate(lines):
         original_line = line
         if web_server == 'LiteSpeed':
             line = line.replace('Allow from', 'Allow').replace('Deny from', 'Deny')
         elif web_server == 'Apache2':
             line = line.replace('Allow', 'Allow from').replace('Deny', 'Deny from')
-        new_lines.append(line)
         if line != original_line:
             modified_lines.append((i + 1, original_line.strip(), line.strip()))
 
@@ -149,7 +118,7 @@ async def correct_syntax(domain, config_path, web_server):
             backup_path = f"{config_path}.bak"
             shutil.copyfile(config_path, backup_path)
             async with aiofiles.open(config_path, 'w') as file:
-                await file.writelines(new_lines)
+                await file.writelines(lines)
             logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
             file_hashes[config_path] = compute_file_hash(config_path)
         else:
@@ -169,18 +138,6 @@ def test_config(web_server):
         logger.error(f'Configuration test failed: {e.stderr.decode()}')
         return False
 
-async def config_needs_update(config_path, web_server):
-    async with aiofiles.open(config_path, 'r') as file:
-        lines = await file.readlines()
-
-    for line in lines:
-        if web_server == 'LiteSpeed' and ('Allow from' in line or 'Deny from' in line):
-            return True
-        if web_server == 'Apache2' and ('Allow ' in line or 'Deny ' in line):
-            return True
-
-    return False
-
 class DomainConfigHandler(FileSystemEventHandler):
     def __init__(self, web_server):
         self.web_server = web_server
@@ -195,8 +152,7 @@ class DomainConfigHandler(FileSystemEventHandler):
             async with aiomultiprocess.Pool() as pool:
                 for domain, config_paths in self.batch.items():
                     for config_path in config_paths:
-                        if await config_needs_update(config_path, self.web_server):
-                            tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
+                        tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
             await asyncio.gather(*tasks)
             self.batch.clear()
 
@@ -209,11 +165,8 @@ class DomainConfigHandler(FileSystemEventHandler):
             return
 
         config_path = event.src_path
-        if not config_path.endswith('httpd.conf'):
-            return
-
         domain = os.path.basename(os.path.dirname(os.path.dirname(config_path)))
-        if domain_exists(domain):
+        if domain_exists(domain) and config_path.endswith('httpd.conf'):
             logger.info(f'Scheduling change in config for domain: {domain}')
             self.schedule_processing(domain, config_path)
 
@@ -227,29 +180,25 @@ class DomainConfigHandler(FileSystemEventHandler):
 
 def main():
     global last_web_server
-    web_server, _ = detect_web_server()
+    web_server = detect_web_server()
 
     if web_server != last_web_server:
+        logger.info(f'Web server changed from {last_web_server} to {web_server}')
         last_web_server = web_server
-        logger.info(f'Web server switched to: {web_server}')
 
     if web_server:
-        logger.info(f'{web_server} detected as active web server.')
-
-        event_handler = DomainConfigHandler(web_server)
         observer = Observer()
-        observer.schedule(event_handler, path=VHOSTS_PATH, recursive=True)
+        handler = DomainConfigHandler(web_server)
+        observer.schedule(handler, path='/var/www/vhosts/system/', recursive=True)
         observer.start()
-
         try:
             while True:
                 time.sleep(CHECK_INTERVAL)
-                cleanup_old_logs()
         except KeyboardInterrupt:
             observer.stop()
         observer.join()
     else:
-        logger.warning('No web server detected.')
+        logger.error('No web server detected. Exiting...')
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
