@@ -54,19 +54,18 @@ def cleanup_old_logs():
                 os.remove(file_path)
                 logger.info(f'Removed old log file: {file_path}')
 
-def is_web_server_running(command):
-    logger.debug(f'Checking web server status with command: {command}')
+def is_web_server_running(service_name):
+    logger.debug(f'Checking web server status with systemctl: {service_name}')
     try:
-        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logger.debug(f'Web server status command output: {result.stdout.decode()}')
+        result = subprocess.run(['systemctl', 'is-active', '--quiet', service_name])
         return result.returncode == 0
     except Exception as e:
         logger.error(f'Error checking web server status: {e}')
         return False
 
 def detect_web_server():
-    apache_running = is_web_server_running(['/usr/sbin/apache2ctl', 'status'])
-    litespeed_running = is_web_server_running(['/usr/local/lsws/bin/lswsctrl', 'status'])
+    apache_running = is_web_server_running('apache2')
+    litespeed_running = is_web_server_running('lshttpd')
 
     if apache_running and litespeed_running:
         logger.warning('Both Apache2 and LiteSpeed detected as running. Prioritizing Apache2.')
@@ -187,7 +186,7 @@ class DomainConfigHandler(FileSystemEventHandler):
 
         config_path = event.src_path
         domain = os.path.basename(os.path.dirname(os.path.dirname(config_path)))
-        if domain_exists(domain) and config_path.endswith('httpd.conf'):
+        if domain_exists(domain) and config_path.endswith('conf/httpd.conf'):
             logger.info(f'Scheduling change in config for domain: {domain}')
             self.schedule_processing(domain, config_path)
 
