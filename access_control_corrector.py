@@ -54,26 +54,51 @@ def cleanup_old_logs():
                 os.remove(file_path)
                 logger.info(f'Removed old log file: {file_path}')
 
-def is_web_server_running(service_name):
-    logger.debug(f'Checking web server status with systemctl: {service_name}')
+def get_listening_ports():
+    """Get a list of listening ports with their associated process names."""
     try:
-        result = subprocess.run(['systemctl', 'is-active', '--quiet', service_name])
-        return result.returncode == 0
+        result = subprocess.run(['netstat', '-ntlp'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            return result.stdout
     except Exception as e:
-        logger.error(f'Error checking web server status: {e}')
-        return False
+        logger.error(f'Error executing netstat: {e}')
+    return ''
+
+def get_process_info():
+    """Get a list of running processes."""
+    try:
+        result = subprocess.run(['ps', 'aux'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            return result.stdout
+    except Exception as e:
+        logger.error(f'Error executing ps: {e}')
+    return ''
 
 def detect_web_server():
-    apache_running = is_web_server_running('apache2')
-    litespeed_running = is_web_server_running('lshttpd')
+    netstat_output = get_listening_ports()
+    ps_output = get_process_info()
 
-    if apache_running and litespeed_running:
-        logger.warning('Both Apache2 and LiteSpeed detected as running. Prioritizing Apache2.')
-        return 'Apache2', 'LiteSpeed'
-    elif apache_running:
-        return 'Apache2', None
-    elif litespeed_running:
-        return 'LiteSpeed', None
+    apache_ports = ['80', '443']
+    litespeed_ports = ['80', '443']
+    apache_processes = ['apache2', 'httpd']
+    litespeed_processes = ['litespeed', 'lshttpd']
+
+    # Check netstat output for ports
+    for line in netstat_output.split('\n'):
+        if any(f':{port} ' in line for port in apache_ports):
+            if any(proc in line for proc in apache_processes):
+                return 'Apache2', None
+        if any(f':{port} ' in line for port in litespeed_ports):
+            if any(proc in line for proc in litespeed_processes):
+                return 'LiteSpeed', None
+
+    # Check ps output for processes
+    for line in ps_output.split('\n'):
+        if any(proc in line for proc in apache_processes):
+            return 'Apache2', None
+        if any(proc in line for proc in litespeed_processes):
+            return 'LiteSpeed', None
+
     return None, None
 
 def domain_exists(domain):
@@ -108,12 +133,14 @@ async def correct_syntax(domain, config_path, web_server):
         lines = await file.readlines()
 
     modified_lines = []
+    new_lines = []
     for i, line in enumerate(lines):
         original_line = line
         if web_server == 'LiteSpeed':
             line = line.replace('Allow from', 'Allow').replace('Deny from', 'Deny')
         elif web_server == 'Apache2':
             line = line.replace('Allow', 'Allow from').replace('Deny', 'Deny from')
+        new_lines.append(line)
         if line != original_line:
             modified_lines.append((i + 1, original_line.strip(), line.strip()))
 
@@ -122,7 +149,7 @@ async def correct_syntax(domain, config_path, web_server):
             backup_path = f"{config_path}.bak"
             shutil.copyfile(config_path, backup_path)
             async with aiofiles.open(config_path, 'w') as file:
-                await file.writelines(lines)
+                await file.writelines(new_lines)
             logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
             file_hashes[config_path] = compute_file_hash(config_path)
         else:
@@ -145,16 +172,13 @@ def test_config(web_server):
 async def config_needs_update(config_path, web_server):
     async with aiofiles.open(config_path, 'r') as file:
         lines = await file.readlines()
-    
+
     for line in lines:
-        if web_server == 'LiteSpeed':
-            if 'Allow from' in line or 'Deny from' in line:
-                return True
-        elif web_server == 'Apache2':
-            if 'Allow' in line and 'Allow from' not in line:
-                return True
-            if 'Deny' in line and 'Deny from' not in line:
-                return True
+        if web_server == 'LiteSpeed' and ('Allow from' in line or 'Deny from' in line):
+            return True
+        if web_server == 'Apache2' and ('Allow ' in line or 'Deny ' in line):
+            return True
+
     return False
 
 class DomainConfigHandler(FileSystemEventHandler):
@@ -185,8 +209,11 @@ class DomainConfigHandler(FileSystemEventHandler):
             return
 
         config_path = event.src_path
+        if not config_path.endswith('httpd.conf'):
+            return
+
         domain = os.path.basename(os.path.dirname(os.path.dirname(config_path)))
-        if domain_exists(domain) and config_path.endswith('conf/httpd.conf'):
+        if domain_exists(domain):
             logger.info(f'Scheduling change in config for domain: {domain}')
             self.schedule_processing(domain, config_path)
 
@@ -203,9 +230,8 @@ def main():
     web_server, _ = detect_web_server()
 
     if web_server != last_web_server:
-        logger.info(f'Web server switch detected: {last_web_server} -> {web_server}')
-        file_hashes.clear()
         last_web_server = web_server
+        logger.info(f'Web server switched to: {web_server}')
 
     if web_server:
         logger.info(f'{web_server} detected as active web server.')
