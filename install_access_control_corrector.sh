@@ -49,7 +49,7 @@ source "$VENV_DIR/bin/activate"
 
 # Install Python packages
 pip install --upgrade pip
-pip install aiofiles aiomultiprocess watchdog
+pip install -r "$INSTALL_DIR/requirements.txt"
 
 # Deactivate virtual environment
 deactivate

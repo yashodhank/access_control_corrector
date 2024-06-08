@@ -22,7 +22,7 @@ git pull origin main
 # Activate virtual environment and install dependencies
 source "$INSTALL_DIR/venv/bin/activate"
 pip install --upgrade pip
-pip install aiofiles aiomultiprocess watchdog
+pip install -r "$INSTALL_DIR/requirements.txt"
 deactivate
 
 # Start the service
