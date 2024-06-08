@@ -36,6 +36,10 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
 domain_cache = {}
 
 def cleanup_old_logs():
@@ -48,8 +52,10 @@ def cleanup_old_logs():
                 logger.info(f'Removed old log file: {file_path}')
 
 def is_web_server_running(command):
+    logger.debug(f'Checking web server status with command: {command}')
     try:
         result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logger.debug(f'Web server status command output: {result.stdout.decode()}')
         return result.returncode == 0
     except Exception as e:
         logger.error(f'Error checking web server status: {e}')
@@ -71,12 +77,18 @@ def detect_web_server():
 def domain_exists(domain):
     if domain in domain_cache:
         return domain_cache[domain]
+    logger.debug(f'Checking if domain exists: {domain}')
     result = subprocess.run(['/usr/local/psa/bin/domain', '-i', domain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     exists = result.returncode == 0
     domain_cache[domain] = exists
+    if exists:
+        logger.debug(f'Domain exists: {domain}')
+    else:
+        logger.debug(f'Domain does not exist: {domain}')
     return exists
 
 async def correct_syntax(domain, config_path, web_server):
+    logger.debug(f'Correcting syntax for domain: {domain}, config_path: {config_path}, web_server: {web_server}')
     async with aiofiles.open(config_path, 'r') as file:
         config = await file.readlines()
 
@@ -96,8 +108,10 @@ async def correct_syntax(domain, config_path, web_server):
 
 def test_config(web_server):
     command = ['/usr/sbin/apache2ctl', 'configtest'] if web_server == 'Apache2' else ['/usr/local/lsws/bin/lswsctrl', 'restart']
+    logger.debug(f'Testing configuration with command: {command}')
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logger.debug(f'Configuration test command output: {result.stdout.decode()}')
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f'Configuration test failed: {e.stderr.decode()}')
@@ -123,6 +137,7 @@ class DomainConfigHandler(FileSystemEventHandler):
 
     def schedule_processing(self, domain, config_path):
         self.batch[domain].add(config_path)
+        logger.debug(f'Scheduled processing for domain: {domain}, config_path: {config_path}')
 
     def process(self, event):
         if event.is_directory:
@@ -135,9 +150,11 @@ class DomainConfigHandler(FileSystemEventHandler):
             self.schedule_processing(domain, config_path)
 
     def on_modified(self, event):
+        logger.debug(f'File modified: {event.src_path}')
         self.process(event)
 
     def on_created(self, event):
+        logger.debug(f'File created: {event.src_path}')
         self.process(event)
 
 def main():
