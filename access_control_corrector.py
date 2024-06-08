@@ -15,6 +15,8 @@ import aiofiles
 import aiomultiprocess
 import re
 import shutil
+import requests
+import tempfile
 
 # Configurations
 LOG_FILE = '/var/log/access_control_corrector.log'
@@ -22,16 +24,17 @@ MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
 LOG_RETENTION = 3 * 30 * 24 * 60 * 60  # 3 months in seconds
 CHECK_INTERVAL = 3600  # Check every hour
 BATCH_INTERVAL = 10  # Batch interval for processing changes
+APACHE_VHOSTS_PATH = '/etc/apache2/plesk.conf.d/vhosts/'
 
 # Set up argument parser
 parser = argparse.ArgumentParser(description="Access Control Corrector Service")
 parser.add_argument('--dry-run', action='store_true', help="Run in dry mode (no changes will be made)")
-parser.add_argument('--verbose', action='store_true', help="Run in verbose mode (detailed logging)")
+parser.add_argument('--verbose', choices=['DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL', 'PANIC'], default='ERROR', help="Set the logging level")
 args = parser.parse_args()
 
 # Set up logging
 logger = logging.getLogger('AccessControlCorrector')
-logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+logger.setLevel(getattr(logging, args.verbose))
 handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_SIZE, backupCount=5)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
@@ -44,6 +47,10 @@ logger.addHandler(console_handler)
 domain_cache = {}
 file_hashes = {}
 last_web_server = None
+
+def update_domain_cache():
+    domains = get_plesk_domains()
+    domain_cache.update({domain: True for domain in domains})
 
 def cleanup_old_logs():
     current_time = time.time()
@@ -76,60 +83,135 @@ def detect_web_server():
         return web_server
     return None
 
-def domain_exists(domain):
-    if domain in domain_cache:
-        return domain_cache[domain]
-    logger.debug(f'Checking if domain exists: {domain}')
-    result = subprocess.run(['plesk', 'bin', 'domain', '-i', domain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    exists = result.returncode == 0
-    domain_cache[domain] = exists
-    if exists:
-        logger.debug(f'Domain exists: {domain}')
-    else:
-        logger.debug(f'Domain does not exist: {domain}')
-    return exists
+def get_plesk_domains():
+    logger.info('Fetching list of domains from Plesk...')
+    try:
+        result = subprocess.run(['plesk', 'bin', 'domain', '--list'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        domains = result.stdout.splitlines()
+        domain_cache.update({domain: True for domain in domains})
+        logger.debug(f'Domains found: {domains}')
+        return domains
+    except subprocess.CalledProcessError as e:
+        logger.error(f'Error fetching domains from Plesk: {e.stderr}')
+        return []
 
-def compute_file_hash(filepath):
+def domain_exists(domain):
+    if domain not in domain_cache:
+        update_domain_cache()
+    return domain_cache.get(domain, False)
+
+async def compute_file_hash(filepath):
     hash_md5 = hashlib.md5()
-    with open(filepath, 'rb') as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
+    try:
+        async with aiofiles.open(filepath, 'rb') as f:
+            while True:
+                chunk = await f.read(4096)
+                if not chunk:
+                    break
+                hash_md5.update(chunk)
+    except Exception as e:
+        logger.error(f'Error reading file for hash computation {filepath}: {e}')
+        raise
     return hash_md5.hexdigest()
+
+def contains_ip_address(line):
+    ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b')
+    return bool(ip_pattern.search(line))
 
 async def correct_syntax(domain, config_path, web_server):
     logger.debug(f'Correcting syntax for domain: {domain}, config_path: {config_path}, web_server: {web_server}')
     
-    current_hash = compute_file_hash(config_path)
+    try:
+        current_hash = await compute_file_hash(config_path)
+    except Exception as e:
+        logger.error(f'Error computing file hash for {config_path}: {e}')
+        return
+
     if file_hashes.get(config_path) == current_hash:
         logger.debug(f'No changes detected in {config_path}. Skipping.')
         return
     
-    async with aiofiles.open(config_path, 'r') as file:
-        lines = await file.readlines()
+    try:
+        async with aiofiles.open(config_path, 'r') as file:
+            lines = await file.readlines()
+    except Exception as e:
+        logger.error(f'Error reading file {config_path}: {e}')
+        return
 
     modified_lines = []
+    allow_pattern = re.compile(r'\bAllow from\b', re.IGNORECASE)
+    deny_pattern = re.compile(r'\bDeny from\b', re.IGNORECASE)
+    order_pattern = re.compile(r'\bOrder\b', re.IGNORECASE)
+    
+    inside_acl_block = False
+    acl_block_start = None
+
     for i, line in enumerate(lines):
         original_line = line
         if web_server == 'LiteSpeed':
-            line = line.replace('Allow from', 'Allow').replace('Deny from', 'Deny')
+            if contains_ip_address(line):
+                inside_acl_block = True
+                if acl_block_start is None:
+                    acl_block_start = i
+            elif inside_acl_block and not contains_ip_address(line):
+                inside_acl_block = False
+                acl_block_start = None
+
+            if inside_acl_block:
+                line = allow_pattern.sub('Allow', line)
+                line = deny_pattern.sub('Deny', line)
+                if order_pattern.search(line):
+                    line = re.sub(r'Order Deny,Allow', 'Order Allow,Deny', line)
         elif web_server == 'Apache2':
-            line = line.replace('Allow', 'Allow from').replace('Deny', 'Deny from')
+            if contains_ip_address(line):
+                inside_acl_block = True
+                if acl_block_start is None:
+                    acl_block_start = i
+            elif inside_acl_block and not contains_ip_address(line):
+                inside_acl_block = False
+                acl_block_start = None
+
+            if inside_acl_block:
+                line = re.sub(r'\bAllow\b(?! from)', 'Allow from', line)
+                line = re.sub(r'\bDeny\b(?! from)', 'Deny from', line)
+
         if line != original_line:
+            lines[i] = line
             modified_lines.append((i + 1, original_line.strip(), line.strip()))
 
     if modified_lines:
         if not args.dry_run:
             backup_path = f"{config_path}.bak"
-            shutil.copyfile(config_path, backup_path)
-            async with aiofiles.open(config_path, 'w') as file:
-                await file.writelines(lines)
-            logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
-            file_hashes[config_path] = compute_file_hash(config_path)
+            try:
+                temp_file_path = None
+                async with aiofiles.open(config_path, 'r') as f:
+                    temp_file_path = f"{config_path}.tmp"
+                    async with aiofiles.open(temp_file_path, 'w') as tmp_file:
+                        await tmp_file.writelines(lines)
+                
+                shutil.copyfile(config_path, backup_path)
+                os.replace(temp_file_path, config_path)  # Atomic write
+                
+                logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
+                file_hashes[config_path] = await compute_file_hash(config_path)
+            except Exception as e:
+                logger.error(f'Error writing corrected file {config_path}: {e}')
+                if temp_file_path and os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
         else:
             logger.info(f'[Dry-Run] Backup and syntax correction would be done for {config_path} (domain: {domain})')
 
         for line_no, original, modified in modified_lines:
             logger.debug(f"Line {line_no}: {original} -> {modified}")
+
+def validate_config_file(config_path):
+    if not os.path.exists(config_path):
+        logger.error(f'Configuration file {config_path} does not exist.')
+        return False
+    if not os.access(config_path, os.R_OK | os.W_OK):
+        logger.error(f'Configuration file {config_path} is not readable/writable.')
+        return False
+    return True
 
 def test_config(web_server):
     command = ['/usr/sbin/apache2ctl', 'configtest'] if web_server == 'Apache2' else ['/usr/local/lsws/bin/lswsctrl', 'restart']
@@ -141,6 +223,26 @@ def test_config(web_server):
     except subprocess.CalledProcessError as e:
         logger.error(f'Configuration test failed: {e.stderr.decode()}')
         return False
+
+def check_403_error(domain):
+    try:
+        response = requests.get(f'http://{domain}')
+        if response.status_code == 403:
+            return True
+    except requests.RequestException as e:
+        logger.error(f'Error checking domain {domain} for 403 error: {e}')
+    return False
+
+async def initial_check(web_server):
+    logger.info('Performing initial check on all domain configurations...')
+    domains = get_plesk_domains()
+    async with aiomultiprocess.Pool() as pool:
+        tasks = [
+            pool.apply(correct_syntax, args=(domain, os.path.join(APACHE_VHOSTS_PATH, f'{domain}.conf'), web_server))
+            for domain in domains if os.path.exists(os.path.join(APACHE_VHOSTS_PATH, f'{domain}.conf'))
+        ]
+        await asyncio.gather(*tasks)
+
 
 class DomainConfigHandler(FileSystemEventHandler):
     def __init__(self, web_server):
@@ -156,7 +258,8 @@ class DomainConfigHandler(FileSystemEventHandler):
             async with aiomultiprocess.Pool() as pool:
                 for domain, config_paths in self.batch.items():
                     for config_path in config_paths:
-                        tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
+                        if check_403_error(domain):
+                            tasks.append(pool.apply(correct_syntax, args=(domain, config_path, self.web_server)))
             await asyncio.gather(*tasks)
             self.batch.clear()
 
@@ -169,8 +272,11 @@ class DomainConfigHandler(FileSystemEventHandler):
             return
 
         config_path = event.src_path
-        domain = os.path.basename(os.path.dirname(os.path.dirname(config_path)))
-        if domain_exists(domain) and config_path.endswith('httpd.conf'):
+        if not config_path.endswith('.conf'):
+            return
+
+        domain = os.path.splitext(os.path.basename(config_path))[0]
+        if domain_exists(domain):
             logger.info(f'Scheduling change in config for domain: {domain}')
             self.schedule_processing(domain, config_path)
 
@@ -178,31 +284,37 @@ class DomainConfigHandler(FileSystemEventHandler):
         logger.debug(f'File modified: {event.src_path}')
         self.process(event)
 
-    def on_created(self, event):
-        logger.debug(f'File created: {event.src_path}')
-        self.process(event)
-
 def main():
     global last_web_server
     web_server = detect_web_server()
+    if not web_server:
+        logger.error('No active web server detected. Exiting...')
+        return
+    logger.info(f'Web server changed from {last_web_server} to {web_server}')
+    last_web_server = web_server
 
-    if web_server != last_web_server:
-        logger.info(f'Web server changed from {last_web_server} to {web_server}')
-        last_web_server = web_server
+    # Ensure the observer path exists
+    if not os.path.exists(APACHE_VHOSTS_PATH):
+        logger.error(f'Path {APACHE_VHOSTS_PATH} does not exist. Exiting...')
+        return
 
-    if web_server:
-        observer = Observer()
-        handler = DomainConfigHandler(web_server)
-        observer.schedule(handler, path='/var/www/vhosts/system/', recursive=True)
+    handler = DomainConfigHandler(web_server)
+    observer = Observer()
+    try:
+        observer.schedule(handler, path=APACHE_VHOSTS_PATH, recursive=True)
         observer.start()
-        try:
-            while True:
-                time.sleep(CHECK_INTERVAL)
-        except KeyboardInterrupt:
-            observer.stop()
-        observer.join()
-    else:
-        logger.error('No web server detected. Exiting...')
+    except OSError as e:
+        logger.error(f'Failed to start observer: {e}')
+        return
 
-if __name__ == "__main__":
+    try:
+        asyncio.run(initial_check(web_server))
+        asyncio.get_event_loop().run_forever()
+    except KeyboardInterrupt:
+        observer.stop()
+    finally:
+        observer.join()
+
+if __name__ == '__main__':
+    cleanup_old_logs()
     main()
