@@ -90,21 +90,30 @@ def domain_exists(domain):
 async def correct_syntax(domain, config_path, web_server):
     logger.debug(f'Correcting syntax for domain: {domain}, config_path: {config_path}, web_server: {web_server}')
     async with aiofiles.open(config_path, 'r') as file:
-        config = await file.readlines()
+        lines = await file.readlines()
 
-    if web_server == 'LiteSpeed':
-        config = [line.replace('Allow from', 'Allow').replace('Deny from', 'Deny') for line in config]
-    elif web_server == 'Apache2':
-        config = [line.replace('Allow', 'Allow from').replace('Deny', 'Deny from') for line in config]
+    modified_lines = []
+    for i, line in enumerate(lines):
+        original_line = line
+        if web_server == 'LiteSpeed':
+            line = line.replace('Allow from', 'Allow').replace('Deny from', 'Deny')
+        elif web_server == 'Apache2':
+            line = line.replace('Allow', 'Allow from').replace('Deny', 'Deny from')
+        if line != original_line:
+            modified_lines.append((i + 1, original_line.strip(), line.strip()))
 
-    backup_path = f"{config_path}.bak"
-    if not args.dry_run:
-        shutil.copyfile(config_path, backup_path)
-        async with aiofiles.open(config_path, 'w') as file:
-            await file.writelines(config)
-        logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
-    else:
-        logger.info(f'[Dry-Run] Backup and syntax correction would be done for {config_path} (domain: {domain})')
+    if modified_lines:
+        if not args.dry_run:
+            backup_path = f"{config_path}.bak"
+            shutil.copyfile(config_path, backup_path)
+            async with aiofiles.open(config_path, 'w') as file:
+                await file.writelines(lines)
+            logger.info(f'Syntax corrected for {web_server} in {config_path} for domain: {domain}')
+        else:
+            logger.info(f'[Dry-Run] Backup and syntax correction would be done for {config_path} (domain: {domain})')
+
+        for line_no, original, modified in modified_lines:
+            logger.debug(f"Line {line_no}: {original} -> {modified}")
 
 def test_config(web_server):
     command = ['/usr/sbin/apache2ctl', 'configtest'] if web_server == 'Apache2' else ['/usr/local/lsws/bin/lswsctrl', 'restart']
