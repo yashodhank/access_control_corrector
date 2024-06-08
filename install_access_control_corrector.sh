@@ -41,7 +41,7 @@ install_dependencies
 if [ -d "$INSTALL_DIR" ]; then
     rm -rf "$INSTALL_DIR"
 fi
-git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
+git clone --progress --depth 1 "$REPO_URL" "$INSTALL_DIR"
 
 # Set up Python virtual environment
 python3 -m venv "$VENV_DIR"
