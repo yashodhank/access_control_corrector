@@ -5,9 +5,11 @@ import re
 import hashlib
 import shutil
 import logging
+import subprocess
 from logging.handlers import RotatingFileHandler
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from datetime import datetime
 
 # Configurations
 LOG_FILE = '/var/log/access_control_corrector.log'
@@ -28,6 +30,39 @@ logger.addHandler(console_handler)
 
 file_hashes = {}
 modification_stats = {}
+web_server = None
+
+def detect_web_server():
+    global web_server
+    while web_server is None:
+        try:
+            ps_output = subprocess.check_output(['ps', 'aux']).decode()
+            netstat_output = subprocess.check_output(['netstat', '-ntlp']).decode()
+
+            if 'litespeed' in ps_output or (':80' in netstat_output and 'litespeed' in netstat_output):
+                web_server = 'litespeed'
+            elif 'apache2' in ps_output or (':80' in netstat_output and 'apache2' in netstat_output):
+                web_server = 'apache2'
+            else:
+                logger.info('Web server not detected. Retrying...')
+        except Exception as e:
+            logger.error(f'Error detecting web server: {e}')
+        finally:
+            if web_server is None:
+                import time
+                time.sleep(5)  # Retry every 5 seconds
+
+    logger.info(f'Detected web server: {web_server}')
+
+def restart_web_server():
+    try:
+        if web_server == 'apache2':
+            subprocess.check_call(['systemctl', 'reload', 'apache2'])
+        elif web_server == 'litespeed':
+            subprocess.check_call(['service', 'litespeed', 'restart'])
+        logger.info(f'{web_server} gracefully restarted.')
+    except subprocess.CalledProcessError as e:
+        logger.error(f'Failed to restart {web_server}: {e}')
 
 def compute_file_hash(filepath):
     hash_md5 = hashlib.md5()
@@ -52,6 +87,13 @@ def contains_ip_addresses(lines):
     ip_pattern = re.compile(r'\b\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?\b|\b[0-9a-fA-F:]+(\/\d{1,3})?\b')
     return any(ip_pattern.search(line) for line in lines)
 
+def add_modification_comments(lines, indentation):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    script_name = 'AccessControlCorrector'
+    lines.insert(1, f'{indentation}# Modified by {script_name} on {timestamp}\n')
+    lines.append(f'{indentation}# End of modification by {script_name} on {timestamp}\n')
+    return lines
+
 def convert_to_modern_syntax(lines, indentation):
     new_lines = []
     for line in lines:
@@ -66,7 +108,7 @@ def convert_to_modern_syntax(lines, indentation):
                 new_lines.append(f'{indentation}Require ip {ip}\n')
         else:
             new_lines.append(line)
-    return new_lines
+    return add_modification_comments(new_lines, indentation)
 
 def correct_syntax(config_path):
     logger.debug(f'Correcting syntax for config_path: {config_path}')
@@ -143,12 +185,20 @@ def correct_syntax(config_path):
                 shutil.copyfile(config_path, backup_path)
                 os.replace(temp_file_path, config_path)  # Atomic write
 
-                logger.info(f'Syntax corrected in {config_path}')
-                file_hashes[config_path] = compute_file_hash(config_path)
-                modification_stats[config_path] = {
-                    'modifications_count': modifications_count,
-                    'details': modifications_details
-                }
+                # Test the configuration
+                test_command = ['apachectl', 'configtest'] if web_server == 'apache2' else ['lswsctrl', 'restart']
+                try:
+                    subprocess.check_call(test_command)
+                    restart_web_server()
+                    logger.info(f'Syntax corrected and verified in {config_path}')
+                    file_hashes[config_path] = compute_file_hash(config_path)
+                    modification_stats[config_path] = {
+                        'modifications_count': modifications_count,
+                        'details': modifications_details
+                    }
+                except subprocess.CalledProcessError:
+                    logger.error(f'Configuration test failed for {config_path}. Reverting changes.')
+                    shutil.copyfile(backup_path, config_path)
             except Exception as e:
                 logger.error(f'Error writing corrected file {config_path}: {e}')
                 if temp_file_path and os.path.exists(temp_file_path):
@@ -181,7 +231,12 @@ class DomainConfigHandler(FileSystemEventHandler):
     def on_modified(self, event):
         self.process(event)
 
+    def on_created(self, event):
+        self.process(event)
+
 def main():
+    detect_web_server()
+
     if not os.path.exists(APACHE_VHOSTS_PATH):
         logger.error(f'Path {APACHE_VHOSTS_PATH} does not exist. Exiting...')
         return
@@ -193,27 +248,27 @@ def main():
         observer.schedule(handler, APACHE_VHOSTS_PATH, recursive=True)
         observer.start()
         logger.info('Started observing changes in Apache vhosts configurations.')
-    except OSError as e:
-        logger.error(f'Failed to start observer: {e}')
-        return
 
-    # Perform initial syntax correction for all configuration files
-    for root, _, files in os.walk(APACHE_VHOSTS_PATH):
-        for file in files:
-            if file.endswith('.conf'):
-                config_path = os.path.join(root, file)
-                correct_syntax(config_path)
+        # Initial check for existing files
+        for root, _, files in os.walk(APACHE_VHOSTS_PATH):
+            for file in files:
+                if file.endswith('.conf'):
+                    config_path = os.path.join(root, file)
+                    correct_syntax(config_path)
 
-    try:
-        while True:
-            # Keep the script running
-            pass
-    except KeyboardInterrupt:
-        observer.stop()
-        logger.info('Shutting down observer due to keyboard interrupt.')
-    finally:
-        observer.join()
-        display_modification_stats()
+        try:
+            while True:
+                # Keep the script running
+                import time
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+            logger.info('Shutting down observer due to keyboard interrupt.')
+        finally:
+            observer.join()
+            display_modification_stats()
+    except Exception as e:
+        logger.error(f'Error setting up observer: {e}')
 
 if __name__ == '__main__':
     main()
